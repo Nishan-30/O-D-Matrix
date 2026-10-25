@@ -63,8 +63,25 @@ def run(cmd, cwd):
 def fetch_osm(bbox, out: Path):
     s, w, n, e = bbox
     q = f'[out:xml][timeout:120];(way["highway"]({s},{w},{n},{e});>;);out meta;'
-    r = requests.post("https://overpass-api.de/api/interpreter", data={"data": q}, timeout=180)
-    r.raise_for_status(); out.write_bytes(r.content)
+    headers = {'User-Agent': 'OSMSUMOBridge/1.0 (Educational/Research)'}
+    
+    # Alternate Overpass API Mirrors to bypass timeouts
+    urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://kumi.systems/api/interpreter"
+    ]
+    
+    for url in urls:
+        try:
+            r = requests.post(url, data={"data": q}, headers=headers, timeout=60)
+            if r.status_code == 200:
+                out.write_bytes(r.content)
+                return
+        except requests.exceptions.RequestException:
+            continue
+            
+    raise RuntimeError("Shob Overpass API mirror-e timeout hoyeche. Area-ta aro choto kore abar try koro.")
 
 def corridor_info(G, o, d):
     """OSMnx shortest path -> length (m) and free-flow time (s)."""
