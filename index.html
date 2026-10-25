@@ -1,0 +1,46 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>OSM → SUMO Bridge</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+body{margin:0;font:14px system-ui;display:flex;height:100vh}#map{flex:1}
+#p{width:320px;padding:14px;overflow:auto;background:#f6f7f9;border-left:1px solid #ddd}
+button{width:100%;padding:9px;margin:4px 0;cursor:pointer}label{display:block;margin:6px 0}
+input{width:100%;box-sizing:border-box}pre{white-space:pre-wrap;background:#fff;padding:8px;font-size:12px}
+</style></head><body><div id="map"></div><div id="p">
+<h3>OSM → SUMO</h3>
+<p><b>1.</b> Draw area (button) · <b>2.</b> click map: first = Origin, second = Destination</p>
+<button onclick="drawBox()">Select area (2 clicks: corners)</button>
+<button onclick="pick('O')">Set Origin</button><button onclick="pick('D')">Set Destination</button>
+<label>Backend URL<input id="api" value="http://127.0.0.1:8000"></label>
+<label>Lanes on corridor<input id="lanes" type="number" value="2"></label>
+<label>History window (days)<input id="days" type="number" value="7"></label>
+<label>Minor-road background share<input id="bgs" type="number" step="0.05" value="0.35"></label>
+<label><input type="checkbox" id="opt" checked style="width:auto"> Optimise signals (Webster)</label>
+<button onclick="go()"><b>Run pipeline</b></button><pre id="out">Ready.</pre></div>
+<script>
+const map=L.map('map').setView([24.9, 91.87],13);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
+let mode=null,box=null,corner=null,O=null,D=null,mO,mD;
+const out=t=>document.getElementById('out').textContent=t;
+function drawBox(){mode='box';corner=null;out('Click first corner…')}
+function pick(m){mode=m;out('Click map to set '+(m=='O'?'Origin':'Destination'))}
+map.on('click',e=>{
+ if(mode=='box'){ if(!corner){corner=e.latlng;out('Click opposite corner…')}
+  else{ if(box)box.remove(); box=L.rectangle([corner,e.latlng],{color:'#d33'}).addTo(map); mode=null; out('Area set.')}}
+ else if(mode=='O'){O=e.latlng;mO&&mO.remove();mO=L.marker(O).addTo(map).bindTooltip('O',{permanent:true});mode=null;out('Origin set.')}
+ else if(mode=='D'){D=e.latlng;mD&&mD.remove();mD=L.marker(D).addTo(map).bindTooltip('D',{permanent:true});mode=null;out('Destination set.')}
+});
+async function go(){
+ if(!box||!O||!D)return out('Set area, origin and destination first.');
+ const b=box.getBounds(), api=document.getElementById('api').value;
+ const body={bbox:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()],origin:{lat:O.lat,lon:O.lng},dest:{lat:D.lat,lon:D.lng},
+  lanes:+lanes.value,days:+days.value,background_share:+bgs.value,optimize_signals:opt.checked};
+ try{
+  const {job}=await (await fetch(api+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  const t=setInterval(async()=>{const j=await (await fetch(api+'/api/job/'+job)).json();
+   if(j.status=='done'){clearInterval(t);out(JSON.stringify(j.result,null,1)+'\n\nFiles: '+api+'/api/job/'+job+'/file/net.net.xml')}
+   else if(j.status=='error'){clearInterval(t);out('ERROR:\n'+j.error)} else out(j.status+'…')},2000);
+ }catch(e){out('Cannot reach backend: '+e)}
+}
+</script></body></html>

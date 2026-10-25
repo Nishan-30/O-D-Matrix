@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+osmnx
+pandas
+requests
+numpy
+eclipse-sumo
+python-dotenv
