@@ -15,6 +15,8 @@ SUMO_HOME = os.environ.get("SUMO_HOME")
 if not SUMO_HOME:
     import sumo; SUMO_HOME = sumo.SUMO_HOME          # pip eclipse-sumo
 TOOLS = Path(SUMO_HOME) / "tools"
+os.environ["SUMO_HOME"] = str(SUMO_HOME)
+os.environ["PATH"] = str(Path(SUMO_HOME) / "bin") + os.pathsep + os.environ["PATH"]
 sys.path.append(str(TOOLS))
 import sumolib
 
@@ -24,10 +26,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5500", "http
                    allow_methods=["*"], allow_headers=["*"])
 JOBS: dict = {}
 
+@app.middleware("http")          # Chrome "Local Network Access": public https page -> localhost needs this header
+async def pna(request, call_next):
+    resp = await call_next(request)
+    resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    return resp
+
 class Pt(BaseModel): lat: float; lon: float
 class Req(BaseModel):
     bbox: list[float] = Field(..., description="[south, west, north, east]")
-    origin: Pt; dest: Pt
+    origins: list[Pt]; dests: list[Pt]
     lanes: int = 2                       # lanes on the O/D corridor
     days: int = 7                        # aggregation window of stored snapshots
     optimize_signals: bool = True
@@ -58,17 +66,13 @@ def fetch_osm(bbox, out: Path):
     r = requests.post("https://overpass-api.de/api/interpreter", data={"data": q}, timeout=180)
     r.raise_for_status(); out.write_bytes(r.content)
 
-def corridor_info(bbox, o, d):
-    """OSMnx shortest path -> length (m) and free-flow estimate; also capacity hints."""
-    s, w, n, e = bbox
-    G = ox.graph_from_bbox((w, s, e, n), network_type="drive")   # osmnx>=2: (left,bottom,right,top)
-    G = ox.add_edge_speeds(G); G = ox.add_edge_travel_times(G)
+def corridor_info(G, o, d):
+    """OSMnx shortest path -> length (m) and free-flow time (s)."""
     a, b = ox.nearest_nodes(G, o.lon, o.lat), ox.nearest_nodes(G, d.lon, d.lat)
     path = ox.routing.shortest_path(G, a, b, weight="travel_time")
-    if not path: raise ValueError("No drivable path between O and D inside the bbox")
-    length = sum(G[u][v][0]["length"] for u, v in zip(path, path[1:]))
-    tt = sum(G[u][v][0]["travel_time"] for u, v in zip(path, path[1:]))
-    return {"length_m": length, "freeflow_s": tt}
+    if not path: raise ValueError("No drivable path between this O and D inside the bbox (enlarge the area)")
+    ed = [min(G[u][v].values(), key=lambda x: x["travel_time"]) for u, v in zip(path, path[1:])]
+    return {"length_m": round(sum(x["length"] for x in ed)), "freeflow_s": round(sum(x["travel_time"] for x in ed))}
 
 # ---------- 2. DistanceMatrix.ai ----------
 def snap_db():
@@ -103,14 +107,15 @@ def hourly_volumes(ratios, lanes, cap_per_lane=1500):    # PCU/h/lane ~ mixed-fl
     if ratios is None or ratios.empty:
         vc = pd.Series({h: 0.6 * HOURLY[h] for h in range(24)})        # fallback: typical profile, peak v/c=0.6
     else:
-        scale = np.mean([vc_from_ratio(r) / HOURLY[h] for h, r in ratios.items()])   # calibrate profile to observations
-        obs = {h: vc_from_ratio(r) for h, r in ratios.items()}
-        vc = pd.Series({h: obs.get(h, scale * HOURLY[h]) for h in range(24)})
-    return (vc * cap).round().astype(int)         # veh/h (PCU-based, treated as veh/h for simplicity)
+        good = {h: vc_from_ratio(r) for h, r in ratios.items() if r >= 1.1}   # BPR inversion only meaningful when delayed
+        scale = float(np.mean([v / HOURLY[h] for h, v in good.items()])) if good else 0.6
+        vc = pd.Series({h: good[h] if h in good else (min(scale * HOURLY[h], 0.3) if h in ratios.index else scale * HOURLY[h])
+                        for h in range(24)})
+    return (vc * cap).round().astype(int)         # veh/h
 
-def poisson_trips(net, o, d, vols, job: Path):
+def poisson_trips(net, o, d, vols, job: Path, tag="od"):
     """Main O/D demand: non-homogeneous Poisson process (exponential headways) with mixed fleet."""
-    rnd, rows = random.Random(42), []
+    rnd, rows = random.Random(tag), []
     ex, ey = net.convertLonLat2XY(o.lon, o.lat); dx, dy = net.convertLonLat2XY(d.lon, d.lat)
     pick = lambda x, y: min(((e, dist) for e, dist in net.getNeighboringEdges(x, y, 300) if e.allows("passenger")),
                             key=lambda t: t[1], default=(None,))[0]
@@ -120,9 +125,9 @@ def poisson_trips(net, o, d, vols, job: Path):
     for h, v in vols.items():
         t = h * 3600 + rnd.expovariate(max(v, 1) / 3600)
         while t < (h + 1) * 3600:
-            rows.append((t, f"od{i}", rnd.choices(types, w)[0])); i += 1
+            rows.append((t, f"{tag}_{i}", rnd.choices(types, w)[0])); i += 1
             t += rnd.expovariate(max(v, 1) / 3600)
-    with open(job / "od.trips.xml", "w") as f:
+    with open(job / f"{tag}.trips.xml", "w") as f:
         f.write('<routes>\n')
         for t, vid, ty in rows:
             f.write(f'<trip id="{vid}" type="{ty}" depart="{t:.1f}" from="{eo.getID()}" to="{ed.getID()}" departLane="best" departSpeed="max"/>\n')
@@ -134,24 +139,34 @@ def pipeline(jid: str, r: Req):
     job = WORK / jid; job.mkdir(exist_ok=True); st = JOBS[jid]
     def step(m): st["status"] = m
     try:
+        if not r.origins or not r.dests: raise ValueError("Set at least one origin and one destination")
+        pairs = [(i, j, o, d) for i, o in enumerate(r.origins, 1) for j, d in enumerate(r.dests, 1)]
+        if len(pairs) > 25: raise ValueError("Max 25 O-D pairs per run (API quota)")
         step("Downloading OSM"); fetch_osm(r.bbox, job / "map.osm")
-        step("Analysing corridor (OSMnx)"); info = corridor_info(r.bbox, r.origin, r.dest)
-        step("Fetching traffic delay"); fetch_snapshot(r.origin, r.dest)
-        ratios = delay_ratio(r.origin, r.dest, r.days)
+        step("Loading graph (OSMnx)"); s, w, n, e = r.bbox
+        G = ox.add_edge_travel_times(ox.add_edge_speeds(ox.graph_from_bbox((w, s, e, n), network_type="drive")))
         step("Converting to SUMO net")
         run(["netconvert", "--osm-files", "map.osm", "-o", "net.net.xml", "--geometry.remove", "--roundabouts.guess",
              "--ramps.guess", "--junctions.join", "--tls.guess-signals", "--tls.join", "--remove-edges.isolated",
              "--osm.sidewalks", "false", "--no-warnings"], job)
         net = sumolib.net.readNet(str(job / "net.net.xml"))
-        step("Building demand")
-        vols = hourly_volumes(ratios, r.lanes); (job / "vtypes.add.xml").write_text(VTYPES)
-        n_od = poisson_trips(net, r.origin, r.dest, vols, job)
-        total_bg = int(vols.sum() * r.background_share)         # Poisson-like background on minor roads
-        run([sys.executable, TOOLS / "randomTrips.py", "-n", "net.net.xml", "-e", "86400", "-p", f"{86400/max(total_bg,1):.2f}",
+        (job / "vtypes.add.xml").write_text(VTYPES)
+        files, summary, bg_total = [], [], 0
+        for i, j, o, d in pairs:
+            tag = f"O{i}D{j}"; step(f"Pair {tag}: delay + demand")
+            fetch_snapshot(o, d); ratios = delay_ratio(o, d, r.days)
+            vols = hourly_volumes(ratios, r.lanes)
+            n_od = poisson_trips(net, o, d, vols, job, tag)
+            files.append(f"{tag}.trips.xml"); bg_total += int(vols.sum() * r.background_share)
+            summary.append({"pair": tag, **corridor_info(G, o, d), "veh_24h": n_od, "peak_veh_h": int(vols.max()),
+                            "calibrated_with_snapshots": ratios is not None})
+        step("Background traffic (Poisson, minor roads)")
+        period = min(3.9, 86400 / max(bg_total, 1))          # binomial needs period <= N(=4)
+        run([sys.executable, TOOLS / "randomTrips.py", "-n", "net.net.xml", "-e", "86400", "-p", f"{period:.3f}",
              "--binomial", "4", "--prefix", "bg", "--fringe-factor", "5", "-o", "bg.trips.xml",
              "--trip-attributes", 'departLane="best" departSpeed="max"', "--validate"], job)
         step("Routing (duarouter)")
-        run(["duarouter", "-n", "net.net.xml", "--additional-files", "vtypes.add.xml", "-r", "od.trips.xml,bg.trips.xml",
+        run(["duarouter", "-n", "net.net.xml", "--additional-files", "vtypes.add.xml", "-r", ",".join(files + ["bg.trips.xml"]),
              "-o", "routes.rou.xml", "--ignore-errors", "--repair", "--no-warnings"], job)
         cfg_extra = ""
         if r.optimize_signals:
@@ -159,22 +174,21 @@ def pipeline(jid: str, r: Req):
             try:
                 run([sys.executable, TOOLS / "tlsCycleAdaptation.py", "-n", "net.net.xml", "-r", "routes.rou.xml",
                      "-b", "0", "-o", "tls.add.xml"], job); cfg_extra = ",tls.add.xml"
-            except RuntimeError as e: st["warning"] = str(e)[:300]
+            except RuntimeError as ex: st["warning"] = str(ex)[:300]
         (job / "run.sumocfg").write_text(f"""<configuration>
 <input><net-file value="net.net.xml"/><route-files value="routes.rou.xml"/><additional-files value="vtypes.add.xml{cfg_extra}"/></input>
 <time><begin value="0"/><end value="86400"/></time>
 <processing><lateral-resolution value="0.4"/><ignore-route-errors value="true"/><time-to-teleport value="300"/></processing>
 <output><tripinfo-output value="tripinfo.xml"/><summary-output value="summary.xml"/></output></configuration>""")
-        result = {"corridor": info, "od_vehicles_24h": n_od, "hourly_volume": vols.to_dict(),
-                  "calibrated_with_snapshots": ratios is not None, "folder": str(job.resolve())}
+        result = {"pairs": summary, "folder": str(job.resolve())}
         if r.simulate:
             step("Simulating"); run(["sumo", "-c", "run.sumocfg", "--no-warnings"], job)
             ti = pd.read_xml(job / "tripinfo.xml")
             result["sim"] = {"trips": len(ti), "mean_duration_s": round(ti.duration.mean(), 1),
                              "mean_waiting_s": round(ti.waitingTime.mean(), 1), "mean_time_loss_s": round(ti.timeLoss.mean(), 1)}
         st.update(status="done", result=result)
-    except Exception as e:
-        st.update(status="error", error=str(e))
+    except Exception as ex:
+        st.update(status="error", error=str(ex))
 
 @app.post("/api/run")
 def start(r: Req, bg: BackgroundTasks):

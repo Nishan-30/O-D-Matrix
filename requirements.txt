@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
-osmnx
+osmnx>=2.0
+scikit-learn
 pandas
 requests
 numpy

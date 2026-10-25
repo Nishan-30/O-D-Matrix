@@ -4,14 +4,18 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 body{margin:0;font:14px system-ui;display:flex;height:100vh}#map{flex:1}
-#p{width:320px;padding:14px;overflow:auto;background:#f6f7f9;border-left:1px solid #ddd}
-button{width:100%;padding:9px;margin:4px 0;cursor:pointer}label{display:block;margin:6px 0}
-input{width:100%;box-sizing:border-box}pre{white-space:pre-wrap;background:#fff;padding:8px;font-size:12px}
+#p{width:330px;padding:14px;overflow:auto;background:#f6f7f9;border-left:1px solid #ddd}
+button{width:100%;padding:9px;margin:4px 0;cursor:pointer}button.on{background:#2a7;color:#fff;font-weight:600}
+label{display:block;margin:6px 0}input{width:100%;box-sizing:border-box}
+pre{white-space:pre-wrap;background:#fff;padding:8px;font-size:12px}small{color:#555}
 </style></head><body><div id="map"></div><div id="p">
-<h3>OSM → SUMO</h3>
-<p><b>1.</b> Draw area (button) · <b>2.</b> click map: first = Origin, second = Destination</p>
-<button onclick="drawBox()">Select area (2 clicks: corners)</button>
-<button onclick="pick('O')">Set Origin</button><button onclick="pick('D')">Set Destination</button>
+<h3>OSM → SUMO (O-D matrix)</h3>
+<button id="b_bbox" onclick="setMode('bbox')">1. Select area (click 2 corners)</button>
+<button id="b_O" onclick="setMode('O')">2. Add Origins (click map)</button>
+<button id="b_D" onclick="setMode('D')">3. Add Destinations (click map)</button>
+<small>Mode stays ON until you press the button again or Esc. Click a marker to remove it.</small>
+<button onclick="clearAll()">Clear everything</button>
+<p id="cnt"></p>
 <label>Backend URL<input id="api" value="http://127.0.0.1:8000"></label>
 <label>Lanes on corridor<input id="lanes" type="number" value="2"></label>
 <label>History window (days)<input id="days" type="number" value="7"></label>
@@ -19,28 +23,43 @@ input{width:100%;box-sizing:border-box}pre{white-space:pre-wrap;background:#fff;
 <label><input type="checkbox" id="opt" checked style="width:auto"> Optimise signals (Webster)</label>
 <button onclick="go()"><b>Run pipeline</b></button><pre id="out">Ready.</pre></div>
 <script>
-const map=L.map('map').setView([24.9, 91.87],13);
+const map=L.map('map').setView([24.9,91.87],14);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
-let mode=null,box=null,corner=null,O=null,D=null,mO,mD;
-const out=t=>document.getElementById('out').textContent=t;
-function drawBox(){mode='box';corner=null;out('Click first corner…')}
-function pick(m){mode=m;out('Click map to set '+(m=='O'?'Origin':'Destination'))}
+const $=id=>document.getElementById(id),out=t=>$('out').textContent=t;
+const BOX={color:'#d22',weight:3,fillColor:'#d22',fillOpacity:.1};
+let mode=null,box=null,corner=null,O=[],D=[];
+function setMode(m){mode=(mode===m||m===null)?null:m;corner=null;
+ for(const k of['bbox','O','D'])$('b_'+k).classList.toggle('on',mode===k);
+ map.getContainer().style.cursor=mode?'crosshair':'';
+ out(mode=='bbox'?'Click first corner of the area…':mode?'Click map to add '+(mode=='O'?'origins':'destinations')+'. Click the button again to stop.':'Ready.');}
+document.addEventListener('keydown',e=>{if(e.key=='Escape')setMode(null)});
+function relabel(){[['O',O],['D',D]].forEach(([k,a])=>a.forEach((m,i)=>m.setTooltipContent(k+(i+1))));
+ let a='';if(box){const b=box.getBounds(),km=(b.getNorth()-b.getSouth())*111.32*(b.getEast()-b.getWest())*111.32*Math.cos(b.getCenter().lat*Math.PI/180);a=` · area ${km.toFixed(2)} km²`+(km>6?' ⚠ large':'')}
+ $('cnt').textContent=`Origins: ${O.length} · Destinations: ${D.length} · pairs: ${O.length*D.length}${a}`}
+function addPt(k,ll){const arr=k=='O'?O:D;
+ const m=L.marker(ll,{title:'Click to remove'}).addTo(map).bindTooltip(k,{permanent:true});
+ m.on('click',()=>{m.remove();arr.splice(arr.indexOf(m),1);relabel()});arr.push(m);relabel()}
 map.on('click',e=>{
- if(mode=='box'){ if(!corner){corner=e.latlng;out('Click opposite corner…')}
-  else{ if(box)box.remove(); box=L.rectangle([corner,e.latlng],{color:'#d33'}).addTo(map); mode=null; out('Area set.')}}
- else if(mode=='O'){O=e.latlng;mO&&mO.remove();mO=L.marker(O).addTo(map).bindTooltip('O',{permanent:true});mode=null;out('Origin set.')}
- else if(mode=='D'){D=e.latlng;mD&&mD.remove();mD=L.marker(D).addTo(map).bindTooltip('D',{permanent:true});mode=null;out('Destination set.')}
-});
+ if(mode=='bbox'){
+  if(!corner){corner=e.latlng;box&&box.remove();box=L.rectangle([e.latlng,e.latlng],BOX).addTo(map);out('Click opposite corner…')}
+  else{box.setBounds([corner,e.latlng]);setMode(null);out('Area set.');relabel()}}
+ else if(mode=='O'||mode=='D')addPt(mode,e.latlng)});
+map.on('mousemove',e=>{if(mode=='bbox'&&corner&&box)box.setBounds([corner,e.latlng])});
+function clearAll(){[...O,...D].forEach(m=>m.remove());O=[];D=[];box&&box.remove();box=null;setMode(null);relabel()}
+const pt=m=>({lat:m.getLatLng().lat,lon:m.getLatLng().lng});
 async function go(){
- if(!box||!O||!D)return out('Set area, origin and destination first.');
- const b=box.getBounds(), api=document.getElementById('api').value;
- const body={bbox:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()],origin:{lat:O.lat,lon:O.lng},dest:{lat:D.lat,lon:D.lng},
-  lanes:+lanes.value,days:+days.value,background_share:+bgs.value,optimize_signals:opt.checked};
+ if(!box||!O.length||!D.length)return out('Set area, ≥1 origin and ≥1 destination first.');
+ const b=box.getBounds(),api=$('api').value.replace(/\/$/,'');
+ const body={bbox:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()],origins:O.map(pt),dests:D.map(pt),
+  lanes:+$('lanes').value,days:+$('days').value,background_share:+$('bgs').value,optimize_signals:$('opt').checked};
  try{
-  const {job}=await (await fetch(api+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-  const t=setInterval(async()=>{const j=await (await fetch(api+'/api/job/'+job)).json();
-   if(j.status=='done'){clearInterval(t);out(JSON.stringify(j.result,null,1)+'\n\nFiles: '+api+'/api/job/'+job+'/file/net.net.xml')}
-   else if(j.status=='error'){clearInterval(t);out('ERROR:\n'+j.error)} else out(j.status+'…')},2000);
- }catch(e){out('Cannot reach backend: '+e)}
+  const r=await fetch(api+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok)return out('Backend error '+r.status+':\n'+await r.text());
+  const {job}=await r.json();
+  const t=setInterval(async()=>{try{const j=await (await fetch(api+'/api/job/'+job)).json();
+   if(j.status=='done'){clearInterval(t);out(JSON.stringify(j.result,null,1)+(j.warning?'\n\nWARNING: '+j.warning:'')+'\n\nnet: '+api+'/api/job/'+job+'/file/net.net.xml')}
+   else if(j.status=='error'){clearInterval(t);out('ERROR:\n'+j.error)}else out(j.status+'…')}catch(e){clearInterval(t);out('Lost backend: '+e)}},2000);
+ }catch(e){out('Cannot reach backend ('+api+').\n1) Is uvicorn running? Open '+api+'/docs\n2) Chrome: allow "Local network access" for this site (lock icon → Site settings).\n'+e)}
 }
+relabel();
 </script></body></html>
