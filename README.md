@@ -13,7 +13,7 @@ randomTrips.py background → duarouter → tlsCycleAdaptation.py (Webster) → 
 4. Copy `.env.example` to `.env` and add your DistanceMatrix.ai key.
 5. `uvicorn main:app --reload --port 8000`
 6. Serve the frontend: `cd .. && python -m http.server 5500` and open http://localhost:5500
-7. Outputs land in `backend/jobs/<id>/` — open `run.sumocfg` in `sumo-gui`.
+7. Outputs land in `backend/jobs/<id>/` (or download the zip link shown in the UI) — open `run.sumocfg` in `sumo-gui`.
 
 ## Build historical baseline (free tier has no history)
 Call `POST /api/snapshot` (body: `{"o":{"lat":..,"lon":..},"d":{"lat":..,"lon":..}}`) every 15–30 min via
@@ -28,5 +28,3 @@ git push -u origin main
 ```
 Repo → Settings → Pages → Deploy from branch `main` / root. Add `backend/.env`, `jobs/`, `snapshots.db` to `.gitignore`.
 Note: an https GitHub Pages site calling http://127.0.0.1 works in Chrome/Edge/Firefox (localhost is exempt from mixed-content blocking).
-
-In folder, /cmd,[ uvicorn main:app --reload --port 8000 ]
