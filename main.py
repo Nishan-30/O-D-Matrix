@@ -160,8 +160,8 @@ def pipeline(jid: str, r: Req):
         pairs = [(i, j, o, d) for i, o in enumerate(r.origins, 1) for j, d in enumerate(r.dests, 1)]
         if len(pairs) > 25: raise ValueError("Max 25 O-D pairs per run (API quota)")
         step("Downloading OSM"); fetch_osm(r.bbox, job / "map.osm")
-        step("Loading graph (OSMnx)"); s, w, n, e = r.bbox
-        G = ox.add_edge_travel_times(ox.add_edge_speeds(ox.graph_from_bbox((w, s, e, n), network_type="drive")))
+        step("Loading graph (OSMnx)")
+        G = ox.add_edge_travel_times(ox.add_edge_speeds(ox.graph_from_xml(job / "map.osm")))
         step("Converting to SUMO net")
         run(["netconvert", "--osm-files", "map.osm", "-o", "net.net.xml", "--geometry.remove", "--roundabouts.guess",
              "--ramps.guess", "--junctions.join", "--tls.guess-signals", "--tls.join", "--remove-edges.isolated",
