@@ -28,3 +28,5 @@ git push -u origin main
 ```
 Repo → Settings → Pages → Deploy from branch `main` / root. Add `backend/.env`, `jobs/`, `snapshots.db` to `.gitignore`.
 Note: an https GitHub Pages site calling http://127.0.0.1 works in Chrome/Edge/Firefox (localhost is exempt from mixed-content blocking).
+
+In folder, /cmd,[ uvicorn main:app --reload --port 8000 ]
