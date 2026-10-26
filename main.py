@@ -159,9 +159,12 @@ def pipeline(jid: str, r: Req):
         if not r.origins or not r.dests: raise ValueError("Set at least one origin and one destination")
         pairs = [(i, j, o, d) for i, o in enumerate(r.origins, 1) for j, d in enumerate(r.dests, 1)]
         if len(pairs) > 25: raise ValueError("Max 25 O-D pairs per run (API quota)")
-        step("Downloading OSM"); fetch_osm(r.bbox, job / "map.osm")
-        step("Loading graph (OSMnx)")
-        G = ox.add_edge_travel_times(ox.add_edge_speeds(ox.graph_from_xml(job / "map.osm")))
+        step("Downloading & Loading OSM via OSMnx")
+        ox.settings.timeout = 300
+        s, w, n, e = r.bbox
+        G = ox.graph_from_bbox((n, s, e, w), network_type="drive", simplify=True)
+        ox.save_graph_xml(G, filepath=str(job / "map.osm"))
+        G = ox.add_edge_travel_times(ox.add_edge_speeds(G))
         step("Converting to SUMO net")
         run(["netconvert", "--osm-files", "map.osm", "-o", "net.net.xml", "--geometry.remove", "--roundabouts.guess",
              "--ramps.guess", "--junctions.join", "--tls.guess-signals", "--tls.join", "--remove-edges.isolated",
