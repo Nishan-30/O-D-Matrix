@@ -1,5 +1,5 @@
 """OSM -> SUMO pipeline. Run: uvicorn main:app --reload --port 8000"""
-import os, sys, uuid, random, sqlite3, subprocess, shutil, datetime as dt
+import warnings, os, sys, uuid, random, sqlite3, subprocess, shutil, datetime as dt
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import numpy as np, pandas as pd, requests, osmnx as ox
@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+warnings.filterwarnings("ignore", category=FutureWarning)
 load_dotenv()
 KEY = os.getenv("DISTANCEMATRIX_KEY", "")
 WORK, DB = Path("jobs"), "snapshots.db"
@@ -80,6 +81,15 @@ def fetch_osm(bbox, out: Path):
         except requests.RequestException as ex:
             err = f"{url}: {ex}"
     raise RuntimeError(f"All Overpass mirrors failed (last: {err}). Select a smaller area and retry.")
+
+HWY_KPH = {"motorway": 80, "motorway_link": 50, "trunk": 60, "trunk_link": 40, "primary": 50, "primary_link": 35,
+           "secondary": 40, "secondary_link": 30, "tertiary": 30, "tertiary_link": 25, "unclassified": 25,
+           "residential": 20, "living_street": 10, "service": 15, "road": 20}
+def build_graph(osm_file):
+    """OSM XML -> routing graph with speeds (OSM in Bangladesh rarely has maxspeed, so use highway-type defaults)."""
+    G = ox.graph_from_xml(str(osm_file))
+    G = ox.add_edge_speeds(G, hwy_speeds=HWY_KPH, fallback=20)
+    return ox.truncate.largest_component(ox.add_edge_travel_times(G), strongly=True)
 
 def corridor_info(G, o, d):
     """Shortest path on the OSM graph -> length (m) and free-flow time (s)."""
@@ -221,8 +231,7 @@ def pipeline(jid: str, r: Req):
              "--roundabouts.guess", "--ramps.guess", "--junctions.join", "--tls.guess-signals", "--tls.join",
              "--remove-edges.isolated", "--keep-edges.by-vclass", "passenger", "--no-warnings"], job)
         net = sumolib.net.readNet(str(job / "net.net.xml"))
-        G = ox.graph_from_xml(str(job / "map.osm"))
-        G = ox.truncate.largest_component(ox.add_edge_travel_times(ox.add_edge_speeds(G)), strongly=True)
+        G = build_graph(job / "map.osm")
         (job / "vtypes.rou.xml").write_text(VTYPES)
         files, summary, bg_total, warns = [], [], 0, []
         for i, j, o, d in pairs:
