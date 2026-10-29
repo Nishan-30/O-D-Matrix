@@ -1,5 +1,5 @@
 """OSM -> SUMO pipeline. Run: uvicorn main:app --reload --port 8000"""
-import warnings, os, sys, uuid, random, sqlite3, subprocess, shutil, datetime as dt
+import re, json, warnings, os, sys, uuid, random, sqlite3, subprocess, shutil, datetime as dt
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import numpy as np, pandas as pd, requests, osmnx as ox
@@ -14,6 +14,13 @@ load_dotenv()
 KEY = os.getenv("DISTANCEMATRIX_KEY", "")
 WORK, DB = Path("jobs"), "snapshots.db"
 WORK.mkdir(exist_ok=True)
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", 25))            # O-D pairs per run
+MAX_AREA_KM2 = float(os.getenv("MAX_AREA_KM2", 25))    # Overpass/netconvert size guard
+MAX_VEHICLES = int(os.getenv("MAX_VEHICLES", 200000))  # SUMO runtime guard
+SIM_TIMEOUT = int(os.getenv("SIM_TIMEOUT", 3600))      # seconds
+for _p in WORK.iterdir():                              # delete jobs older than 7 days
+    if _p.stat().st_mtime < dt.datetime.now().timestamp() - 7 * 86400:
+        shutil.rmtree(_p, ignore_errors=True) if _p.is_dir() else _p.unlink(missing_ok=True)
 SUMO_HOME = os.environ.get("SUMO_HOME")
 if not SUMO_HOME:
     import sumo; SUMO_HOME = sumo.SUMO_HOME          # pip eclipse-sumo
@@ -46,6 +53,8 @@ class Req(BaseModel):
     start_hour: int = Field(0, ge=0, le=23)     # simulate only this window (e.g. 7-10 for the AM peak)
     end_hour: int = Field(24, ge=1, le=24)
     simulate: bool = True
+    mix: dict[str, float] | None = None         # vehicle shares (any scale, normalised); keys: car motorcycle cng bus truck rickshaw
+    use_live: bool = True                       # call DistanceMatrix.ai (uses quota); off = stored snapshots/default profile only
 
 # ---------- South Asian mixed-flow assumptions (tune with local counts!) ----------
 HOURLY = np.array([.18,.12,.10,.10,.15,.30,.55,.80,1.0,.90,.80,.80,.85,.85,.80,.82,.90,1.0,.95,.80,.60,.45,.32,.24])
@@ -59,8 +68,9 @@ VTYPES = """<routes>
 <vType id="rickshaw" vClass="bicycle" length="2.5" width="1.0" maxSpeed="4" accel="0.8" sigma="0.8" latAlignment="right"/>
 </routes>"""
 
-def run(cmd, cwd):
-    p = subprocess.run([str(c) for c in cmd], cwd=cwd, capture_output=True, text=True)
+def run(cmd, cwd, timeout=None):
+    try: p = subprocess.run([str(c) for c in cmd], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired: raise RuntimeError(f"{Path(str(cmd[0])).name} exceeded {timeout}s. Use a shorter hour window or fewer pairs.")
     if p.returncode: raise RuntimeError(f"{Path(str(cmd[0])).name} failed:\n{(p.stderr or p.stdout)[-1500:]}")
     return p.stdout
 
@@ -156,11 +166,11 @@ def pick_edges(net, o, d):
             if eo != ed and net.getShortestPath(eo, ed, vClass="passenger")[0]: return eo, ed
     raise ValueError("O and D snap to edges with no connecting route in the converted net")
 
-def poisson_trips(net, o, d, vols, job: Path, tag, h0, h1):
+def poisson_trips(net, o, d, vols, job: Path, tag, h0, h1, mix):
     """Main O/D demand: non-homogeneous Poisson process with mixed fleet."""
     rnd, rows = random.Random(tag), []
     eo, ed = pick_edges(net, o, d)
-    types, w = list(MIX), list(MIX.values())
+    types, w = list(mix), list(mix.values())
     for h in range(h0, h1):
         rate = max(int(vols[h]), 1) / 3600; t = h * 3600 + rnd.expovariate(rate)
         while t < (h + 1) * 3600:
@@ -172,7 +182,7 @@ def poisson_trips(net, o, d, vols, job: Path, tag, h0, h1):
         f.write('</routes>')
     return len(rows)
 
-def background(job: Path, n, h0, h1, seed=42):
+def background(job: Path, n, h0, h1, mix, seed=42):
     """Random minor-road trips (randomTrips.py), re-timed to the hourly profile and given the mixed fleet."""
     span = (h1 - h0) * 3600
     run([sys.executable, TOOLS / "randomTrips.py", "-n", "net.net.xml", "-b", h0 * 3600, "-e", h1 * 3600,
@@ -184,7 +194,7 @@ def background(job: Path, n, h0, h1, seed=42):
     times = sorted(rnd.choices(hrs, wt)[0] * 3600 + rnd.random() * 3600 for _ in trips)
     root = ET.Element("routes")
     for t, tr in zip(times, trips):
-        tr.set("depart", f"{t:.1f}"); tr.set("type", rnd.choices(list(MIX), list(MIX.values()))[0]); root.append(tr)
+        tr.set("depart", f"{t:.1f}"); tr.set("type", rnd.choices(list(mix), list(mix.values()))[0]); root.append(tr)
     ET.ElementTree(root).write(job / "bg.trips.xml")
 
 def tls_programs(job: Path):
@@ -210,20 +220,28 @@ def sim_stats(path: Path):
     return out
 
 # ---------- Pipeline ----------
+def norm_mix(m):
+    if not m: return dict(MIX)
+    m = {k: float(v) for k, v in m.items() if k in MIX and float(v) > 0}
+    t = sum(m.values())
+    if t <= 0: raise ValueError("Vehicle mix needs at least one positive share")
+    return {k: v / t for k, v in m.items()}
+
 def check(r: Req):
+    norm_mix(r.mix)
     if not r.origins or not r.dests: raise ValueError("Set at least one origin and one destination")
-    if len(r.origins) * len(r.dests) > 25: raise ValueError("Max 25 O-D pairs per run (API quota)")
+    if len(r.origins) * len(r.dests) > MAX_PAIRS: raise ValueError(f"Max {MAX_PAIRS} O-D pairs per run (set MAX_PAIRS in .env to change)")
     if r.end_hour <= r.start_hour: raise ValueError("end_hour must be greater than start_hour")
     s, w, n, e = r.bbox
     if not (s < n and w < e): raise ValueError("Invalid area")
     km2 = (n - s) * 111.32 * (e - w) * 111.32 * np.cos(np.radians((n + s) / 2))
-    if km2 > 25: raise ValueError(f"Area is {km2:.1f} km2 (max 25). Select a smaller area.")
+    if km2 > MAX_AREA_KM2: raise ValueError(f"Area is {km2:.1f} km2 (max {MAX_AREA_KM2:g}; set MAX_AREA_KM2 in .env). Select a smaller area.")
 
 def pipeline(jid: str, r: Req):
     job = WORK / jid; job.mkdir(exist_ok=True); st = JOBS[jid]
     def step(m): st["status"] = m
     try:
-        check(r); h0, h1 = r.start_hour, r.end_hour
+        check(r); h0, h1 = r.start_hour, r.end_hour; mix = norm_mix(r.mix)
         pairs = [(i, j, o, d) for i, o in enumerate(r.origins, 1) for j, d in enumerate(r.dests, 1)]
         step("Downloading OSM (Overpass)"); fetch_osm(r.bbox, job / "map.osm")
         step("Converting to SUMO net")
@@ -233,20 +251,26 @@ def pipeline(jid: str, r: Req):
         net = sumolib.net.readNet(str(job / "net.net.xml"))
         G = build_graph(job / "map.osm")
         (job / "vtypes.rou.xml").write_text(VTYPES)
-        files, summary, bg_total, warns = [], [], 0, []
+        files, summary, bg_total, warns, total_veh = [], [], 0, [], 0
+        live = r.use_live and bool(KEY)
+        if r.use_live and not KEY: warns.append("no DISTANCEMATRIX_KEY: using stored snapshots / default profile")
         for i, j, o, d in pairs:
             tag = f"O{i}D{j}"; step(f"Pair {tag}: delay + demand")
-            try: fetch_snapshot(o, d)
-            except Exception as ex: warns.append(f"{tag}: live snapshot skipped ({str(ex)[:120]})")
+            if live:
+                try: fetch_snapshot(o, d)
+                except Exception as ex: warns.append(f"{tag}: live snapshot skipped ({str(ex)[:120]})")
             ratios = delay_ratio(o, d, r.days)
             vols = hourly_volumes(ratios, r.lanes)
-            n_od = poisson_trips(net, o, d, vols, job, tag, h0, h1)
+            n_od = poisson_trips(net, o, d, vols, job, tag, h0, h1, mix)
+            total_veh += n_od
+            if total_veh * (1 + r.background_share) > MAX_VEHICLES:
+                raise ValueError(f"~{int(total_veh * (1 + r.background_share))} vehicles exceeds MAX_VEHICLES={MAX_VEHICLES}. Narrow the hour window or reduce pairs/lanes.")
             files.append(f"{tag}.trips.xml"); bg_total += int(sum(vols[h] for h in range(h0, h1)) * r.background_share)
             summary.append({"pair": tag, **corridor_info(G, o, d), "veh_in_window": n_od,
                             "peak_veh_h": int(vols[h0:h1].max()), "calibrated_with_snapshots": ratios is not None})
         if bg_total > 0:
             step("Background traffic (minor roads)")
-            try: background(job, bg_total, h0, h1); files.append("bg.trips.xml")
+            try: background(job, bg_total, h0, h1, mix); files.append("bg.trips.xml")
             except Exception as ex: warns.append(f"background traffic skipped ({str(ex)[:200]})")
         step("Routing (duarouter)")
         run(["duarouter", "-n", "net.net.xml", "-r", ",".join(["vtypes.rou.xml"] + files), "-o", "routes.rou.xml",
@@ -268,7 +292,7 @@ def pipeline(jid: str, r: Req):
 <output><tripinfo-output value="tripinfo.xml"/><summary-output value="summary.xml"/></output></configuration>""")
         result = {"pairs": summary, "folder": str(job.resolve())}
         if r.simulate:
-            step("Simulating"); run(["sumo", "-c", "run.sumocfg", "--no-warnings", "--no-step-log"], job)
+            step("Simulating"); run(["sumo", "-c", "run.sumocfg", "--no-warnings", "--no-step-log"], job, SIM_TIMEOUT)
             result["sim"] = sim_stats(job / "tripinfo.xml")
         st.update(status="done", result=result, warning="; ".join(warns) or None)
     except Exception as ex:
@@ -303,3 +327,29 @@ def get_zip(jid: str):
     d = WORK / Path(jid).name
     if not d.is_dir(): raise HTTPException(404)
     return FileResponse(shutil.make_archive(str(WORK / f"{d.name}_export"), "zip", d), filename=f"sumo_{d.name}.zip")
+
+@app.post("/api/suggest-mix")
+def suggest_mix(p: Pt):
+    """AI + web search: estimate the local vehicle-type mix around a point (needs ANTHROPIC_API_KEY in .env)."""
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key: raise HTTPException(400, "Set ANTHROPIC_API_KEY in backend/.env to use AI search")
+    try:
+        place = requests.get("https://nominatim.openstreetmap.org/reverse", timeout=15, headers={"User-Agent": "OSMSUMOBridge/1.0"},
+                             params={"lat": p.lat, "lon": p.lon, "format": "json", "zoom": 14}).json().get("display_name")
+    except Exception: place = None
+    place = place or f"{p.lat:.5f},{p.lon:.5f}"
+    prompt = (f"Search the web for traffic composition / modal split / vehicle classification count studies near: {place}. "
+              "Estimate the share (%) of vehicles on urban roads there: car, motorcycle, cng (auto-rickshaw/CNG), bus, truck, "
+              "rickshaw (human-pulled/cycle rickshaw). Prefer local studies; otherwise use the closest comparable city. "
+              'Reply with ONLY JSON: {"mix":{"car":0,"motorcycle":0,"cng":0,"bus":0,"truck":0,"rickshaw":0},"basis":"1-2 sentences naming the sources"}. Shares must sum to 100.')
+    r = requests.post("https://api.anthropic.com/v1/messages", timeout=150,
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        json={"model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"), "max_tokens": 1500,
+              "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+              "messages": [{"role": "user", "content": prompt}]})
+    if r.status_code != 200: raise HTTPException(502, f"Anthropic API {r.status_code}: {r.text[:300]}")
+    text = "".join(b.get("text", "") for b in r.json()["content"] if b["type"] == "text")
+    try:
+        j = json.loads(re.search(r"\{.*\}", text, re.S).group(0)); mix = {k: float(j["mix"][k]) for k in MIX}
+    except Exception: raise HTTPException(502, "AI reply was not valid JSON, try again: " + text[:200])
+    return {"place": place, "mix": mix, "basis": j.get("basis", "")}

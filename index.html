@@ -20,9 +20,13 @@ pre{white-space:pre-wrap;background:#fff;padding:8px;font-size:12px}small{color:
 <label>Lanes on corridor<input id="lanes" type="number" value="2"></label>
 <label>History window (days)<input id="days" type="number" value="7"></label>
 <label>Minor-road background share<input id="bgs" type="number" step="0.05" value="0.35"></label>
-<label>Simulate from hour (0-23)<input id="h0" type="number" min="0" max="23" value="0"></label>
-<label>to hour (1-24)<input id="h1" type="number" min="1" max="24" value="24"></label>
+<b>Vehicle mix (%)</b> <small id="msum"></small>
+<div id="mixbox" style="display:grid;grid-template-columns:1fr 1fr;gap:2px 8px"></div>
+<button onclick="suggest()">AI-suggest mix for this area</button>
+<label>Simulate from hour (0-23)<input id="h0" type="number" min="0" max="23" value="6"></label>
+<label>to hour (1-24)<input id="h1" type="number" min="1" max="24" value="10"></label>
 <label><input type="checkbox" id="opt" checked style="width:auto"> Optimise signals (Webster)</label>
+<label><input type="checkbox" id="live" checked style="width:auto"> Use live traffic API (uses quota)</label>
 <button onclick="go()"><b>Run pipeline</b></button><pre id="out">Ready.</pre></div>
 <script>
 const map=L.map('map').setView([24.9,91.87],14);
@@ -36,7 +40,7 @@ function setMode(m){mode=(mode===m||m===null)?null:m;corner=null;
  out(mode=='bbox'?'Click first corner of the area…':mode?'Click map to add '+(mode=='O'?'origins':'destinations')+'. Click the button again to stop.':'Ready.');}
 document.addEventListener('keydown',e=>{if(e.key=='Escape')setMode(null)});
 function relabel(){[['O',O],['D',D]].forEach(([k,a])=>a.forEach((m,i)=>m.setTooltipContent(k+(i+1))));
- let a='';if(box){const b=box.getBounds(),km=(b.getNorth()-b.getSouth())*111.32*(b.getEast()-b.getWest())*111.32*Math.cos(b.getCenter().lat*Math.PI/180);a=` · area ${km.toFixed(2)} km²`+(km>6?' ⚠ large':'')}
+ let a='';if(box){const b=box.getBounds(),km=(b.getNorth()-b.getSouth())*111.32*(b.getEast()-b.getWest())*111.32*Math.cos(b.getCenter().lat*Math.PI/180);a=` · area ${km.toFixed(2)} km²`+(km>25?' ⛔ too large (max 25)':km>6?' ⚠ large':'')}
  $('cnt').textContent=`Origins: ${O.length} · Destinations: ${D.length} · pairs: ${O.length*D.length}${a}`}
 function addPt(k,ll){const arr=k=='O'?O:D;
  const m=L.marker(ll,{title:'Click to remove'}).addTo(map).bindTooltip(k,{permanent:true});
@@ -53,7 +57,7 @@ async function go(){
  if(!box||!O.length||!D.length)return out('Set area, ≥1 origin and ≥1 destination first.');
  const b=box.getBounds(),api=$('api').value.replace(/\/$/,'');
  const body={bbox:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()],origins:O.map(pt),dests:D.map(pt),
-  lanes:+$('lanes').value,days:+$('days').value,background_share:+$('bgs').value,start_hour:+$('h0').value,end_hour:+$('h1').value,optimize_signals:$('opt').checked};
+  lanes:+$('lanes').value,days:+$('days').value,background_share:+$('bgs').value,start_hour:+$('h0').value,end_hour:+$('h1').value,optimize_signals:$('opt').checked,use_live:$('live').checked,mix:Object.fromEntries(MIXK.map(k=>[k,+$('m_'+k).value||0]))};
  try{
   const r=await fetch(api+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(!r.ok){let m=await r.text();try{m=JSON.parse(m).detail||m}catch(_){}return out('Backend error '+r.status+':\n'+(typeof m=='string'?m:JSON.stringify(m)))}
@@ -63,5 +67,13 @@ async function go(){
    else if(j.status=='error'){clearInterval(t);out('ERROR:\n'+j.error)}else out(j.status+'…')}catch(e){clearInterval(t);out('Lost backend: '+e)}},2000);
  }catch(e){out('Cannot reach backend ('+api+').\n1) Is uvicorn running? Open '+api+'/docs\n2) Chrome: allow "Local network access" for this site (lock icon → Site settings).\n'+e)}
 }
-relabel();
+const MIXK=['car','motorcycle','cng','bus','truck','rickshaw'],MIX0=[30,35,15,8,5,7];
+$('mixbox').innerHTML=MIXK.map((k,i)=>`<label>${k}<input id="m_${k}" type="number" min="0" value="${MIX0[i]}" oninput="mixSum()"></label>`).join('');
+function mixSum(){const s=MIXK.reduce((a,k)=>a+(+$('m_'+k).value||0),0);$('msum').textContent='total '+s+'%'+(s==100?'':' (normalised to 100)')}
+async function suggest(){const c=box?box.getBounds().getCenter():map.getCenter(),api=$('api').value.replace(/\/$/,'');out('AI is searching the web for this area… (up to ~1 min)');
+ try{const r=await fetch(api+'/api/suggest-mix',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:c.lat,lon:c.lng})});
+  const j=await r.json();if(!r.ok)return out('AI error: '+(j.detail||r.status));
+  MIXK.forEach(k=>$('m_'+k).value=Math.round(j.mix[k]));mixSum();out('Suggested for: '+j.place+'\n\n'+j.basis+'\n\nReview the numbers, then run.')}
+ catch(e){out('Cannot reach backend: '+e)}}
+mixSum();relabel();
 </script></body></html>
