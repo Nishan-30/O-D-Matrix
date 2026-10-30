@@ -2,7 +2,7 @@
 import re, json, warnings, os, sys, uuid, random, sqlite3, subprocess, shutil, datetime as dt
 import xml.etree.ElementTree as ET
 from pathlib import Path
-import numpy as np, pandas as pd, requests, osmnx as ox
+import numpy as np, pandas as pd, requests, osmnx as ox, networkx as nx
 from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +54,7 @@ class Req(BaseModel):
     end_hour: int = Field(24, ge=1, le=24)
     simulate: bool = True
     mix: dict[str, float] | None = None         # vehicle shares (any scale, normalised); keys: car motorcycle cng bus truck rickshaw
+    pairs: list[tuple[int, int]] | None = None  # [(O index, D index)] 1-based; None = all combinations
     use_live: bool = True                       # call DistanceMatrix.ai (uses quota); off = stored snapshots/default profile only
 
 # ---------- South Asian mixed-flow assumptions (tune with local counts!) ----------
@@ -65,7 +66,7 @@ VTYPES = """<routes>
 <vType id="cng" vClass="passenger" length="2.6" width="1.4" maxSpeed="12" accel="2" sigma="0.7" latAlignment="arbitrary" minGapLat="0.2"/>
 <vType id="bus" vClass="bus" length="11" width="2.5" maxSpeed="13" accel="1.2" sigma="0.5" latAlignment="right"/>
 <vType id="truck" vClass="truck" length="8" width="2.5" maxSpeed="12" accel="1.0" sigma="0.5" latAlignment="right"/>
-<vType id="rickshaw" vClass="bicycle" length="2.5" width="1.0" maxSpeed="4" accel="0.8" sigma="0.8" latAlignment="right"/>
+<vType id="rickshaw" vClass="passenger" length="2.5" width="1.0" maxSpeed="4" accel="0.8" sigma="0.8" latAlignment="right"/>
 </routes>"""
 
 def run(cmd, cwd, timeout=None):
@@ -153,23 +154,34 @@ def hourly_volumes(ratios, lanes, cap_per_lane=1500):    # veh/h/lane, mixed-flo
                         for h in range(24)})
     return (vc * cap).round().astype(int)
 
-def pick_edges(net, o, d):
-    """Closest drivable edges that are actually connected (tries 5x5 candidates)."""
+def main_component(net):
+    """Largest strongly-connected set of edge IDs (routes between them always exist)."""
+    g = nx.DiGraph()
+    for e in net.getEdges():
+        g.add_node(e.getID())
+        for o in e.getOutgoing(): g.add_edge(e.getID(), o.getID())
+    return max(nx.strongly_connected_components(g), key=len)
+
+def pick_edges(net, o, d, ok):
+    """Closest drivable edges inside the main connected network that actually have a route between them."""
     def cands(p):
         x, y = net.convertLonLat2XY(p.lon, p.lat)
-        c = sorted(((e, k) for e, k in net.getNeighboringEdges(x, y, 300) if e.allows("passenger")), key=lambda t: t[1])
-        return [e for e, _ in c[:5]]
+        c = sorted(((e, k) for e, k in net.getNeighboringEdges(x, y, 500)
+                    if e.allows("passenger") and e.getID() in ok), key=lambda t: t[1])
+        return [e for e, _ in c[:8]]
     co, cd = cands(o), cands(d)
-    if not co or not cd: raise ValueError("O or D is >300 m from a drivable edge in the converted net")
+    if not co or not cd: raise ValueError("O or D is >500 m from the main connected road network")
     for eo in co:
         for ed in cd:
             if eo != ed and net.getShortestPath(eo, ed, vClass="passenger")[0]: return eo, ed
     raise ValueError("O and D snap to edges with no connecting route in the converted net")
 
-def poisson_trips(net, o, d, vols, job: Path, tag, h0, h1, mix):
-    """Main O/D demand: non-homogeneous Poisson process with mixed fleet."""
+def poisson_trips(net, o, d, vols, job: Path, tag, h0, h1, mix, ok):
+    """Main O/D demand: non-homogeneous Poisson process, mixed fleet, explicit full route (all middle edges included)."""
     rnd, rows = random.Random(tag), []
-    eo, ed = pick_edges(net, o, d)
+    eo, ed = pick_edges(net, o, d, ok)
+    path = net.getShortestPath(eo, ed, vClass="passenger")[0]
+    edges = " ".join(e.getID() for e in path)
     types, w = list(mix), list(mix.values())
     for h in range(h0, h1):
         rate = max(int(vols[h]), 1) / 3600; t = h * 3600 + rnd.expovariate(rate)
@@ -178,7 +190,7 @@ def poisson_trips(net, o, d, vols, job: Path, tag, h0, h1, mix):
     with open(job / f"{tag}.trips.xml", "w") as f:
         f.write('<routes>\n')
         for i, (t, ty) in enumerate(rows):
-            f.write(f'<trip id="{tag}_{i}" type="{ty}" depart="{t:.1f}" from="{eo.getID()}" to="{ed.getID()}" departLane="best" departSpeed="max"/>\n')
+            f.write(f'<vehicle id="{tag}_{i}" type="{ty}" depart="{t:.1f}" departLane="best" departSpeed="max"><route edges="{edges}"/></vehicle>\n')
         f.write('</routes>')
     return len(rows)
 
@@ -230,7 +242,12 @@ def norm_mix(m):
 def check(r: Req):
     norm_mix(r.mix)
     if not r.origins or not r.dests: raise ValueError("Set at least one origin and one destination")
-    if len(r.origins) * len(r.dests) > MAX_PAIRS: raise ValueError(f"Max {MAX_PAIRS} O-D pairs per run (set MAX_PAIRS in .env to change)")
+    if r.pairs is not None:
+        if any(not (1 <= i <= len(r.origins) and 1 <= j <= len(r.dests)) for i, j in r.pairs): raise ValueError("O-D pair index out of range")
+        npairs = len(set(map(tuple, r.pairs)))
+    else: npairs = len(r.origins) * len(r.dests)
+    if npairs == 0: raise ValueError("Select at least one O-D pair")
+    if npairs > MAX_PAIRS: raise ValueError(f"Max {MAX_PAIRS} O-D pairs per run (set MAX_PAIRS in .env to change)")
     if r.end_hour <= r.start_hour: raise ValueError("end_hour must be greater than start_hour")
     s, w, n, e = r.bbox
     if not (s < n and w < e): raise ValueError("Invalid area")
@@ -242,13 +259,14 @@ def pipeline(jid: str, r: Req):
     def step(m): st["status"] = m
     try:
         check(r); h0, h1 = r.start_hour, r.end_hour; mix = norm_mix(r.mix)
-        pairs = [(i, j, o, d) for i, o in enumerate(r.origins, 1) for j, d in enumerate(r.dests, 1)]
+        allow = set(map(tuple, r.pairs)) if r.pairs is not None else None
+        pairs = [(i, j, o, d) for i, o in enumerate(r.origins, 1) for j, d in enumerate(r.dests, 1) if allow is None or (i, j) in allow]
         step("Downloading OSM (Overpass)"); fetch_osm(r.bbox, job / "map.osm")
         step("Converting to SUMO net")
         run(["netconvert", "--osm-files", "map.osm", "-o", "net.net.xml", "--proj.utm", "--geometry.remove",
              "--roundabouts.guess", "--ramps.guess", "--junctions.join", "--tls.guess-signals", "--tls.join",
              "--remove-edges.isolated", "--keep-edges.by-vclass", "passenger", "--no-warnings"], job)
-        net = sumolib.net.readNet(str(job / "net.net.xml"))
+        net = sumolib.net.readNet(str(job / "net.net.xml")); MAIN = main_component(net)
         G = build_graph(job / "map.osm")
         (job / "vtypes.rou.xml").write_text(VTYPES)
         files, summary, bg_total, warns, total_veh = [], [], 0, [], 0
@@ -261,7 +279,7 @@ def pipeline(jid: str, r: Req):
                 except Exception as ex: warns.append(f"{tag}: live snapshot skipped ({str(ex)[:120]})")
             ratios = delay_ratio(o, d, r.days)
             vols = hourly_volumes(ratios, r.lanes)
-            n_od = poisson_trips(net, o, d, vols, job, tag, h0, h1, mix)
+            n_od = poisson_trips(net, o, d, vols, job, tag, h0, h1, mix, MAIN)
             total_veh += n_od
             if total_veh * (1 + r.background_share) > MAX_VEHICLES:
                 raise ValueError(f"~{int(total_veh * (1 + r.background_share))} vehicles exceeds MAX_VEHICLES={MAX_VEHICLES}. Narrow the hour window or reduce pairs/lanes.")
